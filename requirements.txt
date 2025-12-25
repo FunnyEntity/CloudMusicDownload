@@ -1,0 +1,5 @@
+pycloudmusic
+mutagen
+qrcode
+requests
+Pillow
