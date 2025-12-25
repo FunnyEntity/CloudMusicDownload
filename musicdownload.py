@@ -99,6 +99,13 @@ class MusicDownloadGUI:
         ttk.Radiobutton(quality_frame, text="MP3 (320k)", variable=self.quality_var, value="mp3").pack(side="left", padx=10)
         ttk.Radiobutton(quality_frame, text="FLAC (无损)", variable=self.quality_var, value="flac").pack(side="left", padx=10)
 
+        # Lyrics Download
+        lyric_frame = ttk.LabelFrame(self.root, text="歌词", padding=10)
+        lyric_frame.pack(fill="x", padx=10, pady=5)
+
+        self.lyric_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(lyric_frame, text="下载歌词 (.lrc)", variable=self.lyric_var).pack(side="left", padx=10)
+
         # Download Folder
         folder_frame = ttk.LabelFrame(self.root, text="下载目录", padding=10)
         folder_frame.pack(fill="x", padx=10, pady=5)
@@ -298,8 +305,11 @@ class MusicDownloadGUI:
 
     def get_first_str(self, val):
         if isinstance(val, list):
-            return next((str(x) for x in val if str(x).strip()), "unknown")
-        return str(val) if val else "unknown"
+            for x in val:
+                if x and str(x).strip():
+                    return str(x).strip()
+            return "unknown"
+        return str(val).strip() if val else "unknown"
 
     def get_real_ext(self, filepath):
         try:
@@ -387,6 +397,43 @@ class MusicDownloadGUI:
         except Exception:
             pass
 
+    async def download_lyric(self, music, final_path):
+        """Download lyrics for a song and save as .lrc file"""
+        try:
+            lyric = None
+            if hasattr(music, "lyric"):
+                if callable(music.lyric):
+                    result = music.lyric()
+                    if inspect.isawaitable(result):
+                        lyric = await result
+                    else:
+                        lyric = result
+                else:
+                    lyric = music.lyric
+
+            # Parse lyric data structure
+            if isinstance(lyric, dict):
+                if "lrc" in lyric and isinstance(lyric["lrc"], dict) and "lyric" in lyric["lrc"]:
+                    lyric = lyric["lrc"]["lyric"]
+                elif "lyric" in lyric:
+                    lyric = lyric["lyric"]
+                elif "lrc" in lyric:
+                    lyric = lyric["lrc"]
+                elif "tlyric" in lyric and isinstance(lyric["tlyric"], dict) and "lyric" in lyric["tlyric"]:
+                    lyric = lyric["tlyric"]["lyric"]
+                else:
+                    lyric = ""
+
+            # Write to .lrc file
+            if isinstance(lyric, str) and lyric.strip():
+                lrc_path = os.path.splitext(final_path)[0] + ".lrc"
+                with open(lrc_path, "w", encoding="utf-8") as f:
+                    f.write(lyric)
+                return True, os.path.basename(lrc_path)
+            return False, None
+        except Exception as e:
+            return False, str(e)
+
     def start_download(self):
         self.download_btn.config(state="disabled")
         self.quality = self.quality_var.get()
@@ -394,80 +441,92 @@ class MusicDownloadGUI:
         async def _download():
             total = len(self.song_ids)
             success_count = 0
-            base_dir = os.path.join(self.download_folder, "Single")
-            os.makedirs(base_dir, exist_ok=True)
+            os.makedirs(self.download_folder, exist_ok=True)
 
             for idx, song_id in enumerate(self.song_ids):
                 try:
-                    self.root.after(0, self.update_progress, idx, total, f"正在下载: {song_id}")
+                    music = await self.musicapi.music(song_id)
 
-                    music = await self.musicapi.song(song_id)
+                    # Get metadata first (for filename and display)
+                    artist = music.artist_str if hasattr(music, 'artist_str') else "unknown"
+                    album = music.album_str if hasattr(music, 'album_str') else "unknown"
+                    title = music.name[0] if music.name and len(music.name) > 0 else "unknown"
+
+                    # Display progress
+                    self.root.after(0, self.update_progress, idx, total, f"正在下载: {artist} - {title}")
+                    self.root.after(0, self.log, f"[INFO] 开始下载: {artist} - {title} (ID: {song_id})")
+
+                    # Construct final filename
+                    final_name = self.safe_filename(f"{artist} - {album} - {title}")
+                    final_path = None
+                    real_ext = None
 
                     # Download - handle auto mode (try FLAC first, fallback to MP3)
                     downloaded = False
+                    download_error = None
                     if self.quality == "auto":
                         try:
-                            await music.play(br=999000)  # Try FLAC first
+                            self.root.after(0, self.log, f"[INFO] 尝试 FLAC...")
+                            temp_path = await music.play(br=999000)
                             downloaded = True
-                        except Exception:
+                            real_ext = self.get_real_ext(temp_path)
+                        except Exception as e:
+                            download_error = f"FLAC: {e}"
+                            self.root.after(0, self.log, f"[INFO] FLAC 失败: {e}, 尝试 MP3...")
                             try:
-                                await music.play(br=320000)  # Fallback to MP3
+                                temp_path = await music.play(br=320000)
                                 downloaded = True
-                            except Exception:
-                                pass
+                                real_ext = self.get_real_ext(temp_path)
+                            except Exception as e2:
+                                download_error = f"MP3: {e2}"
+                                self.root.after(0, self.log, f"[INFO] MP3 也失败: {e2}")
                     elif self.quality == "mp3":
-                        await music.play(br=320000)
+                        temp_path = await music.play(br=320000)
                         downloaded = True
+                        real_ext = self.get_real_ext(temp_path)
                     else:  # flac
-                        await music.play(br=999000)
+                        temp_path = await music.play(br=999000)
                         downloaded = True
+                        real_ext = self.get_real_ext(temp_path)
 
-                    if not downloaded:
-                        self.root.after(0, self.log, f"[FAIL] 下载失败: {song_id}")
+                    if not downloaded or not real_ext:
+                        self.root.after(0, self.log, f"[FAIL] 下载失败: {song_id} ({download_error})")
                         continue
 
-                    # Find downloaded file
-                    src_path = None
-                    for ext in [".mp3", ".flac", ".m4a", ".wav"]:
-                        candidate = os.path.join(self.download_folder, f"{song_id}{ext}")
-                        if os.path.exists(candidate):
-                            src_path = candidate
-                            break
+                    # Construct final path with correct extension
+                    final_path = os.path.join(self.download_folder, f"{final_name}{real_ext}")
 
-                    if not src_path:
-                        self.root.after(0, self.log, f"[FAIL] 未找到: {song_id}")
-                        continue
-
-                    # Get metadata
-                    artist = self.get_first_str(getattr(music, "artist_str", None))
-                    album = self.get_first_str(getattr(music, "album_str", None))
-                    title = self.get_first_str(getattr(music, "name", None))
-                    real_ext = self.get_real_ext(src_path)
-
-                    if not real_ext:
-                        self.root.after(0, self.log, f"[FAIL] 无法识别文件: {src_path}")
-                        continue
-
-                    final_name = self.safe_filename(f"{artist} - {album} - {title}{real_ext}")
-                    final_path = os.path.join(base_dir, final_name)
-
+                    # Check if already exists
                     if os.path.exists(final_path):
-                        self.root.after(0, self.log, f"[SKIP] 已存在: {final_name}")
-                        os.remove(src_path)
+                        self.root.after(0, self.log, f"[SKIP] 已存在: {final_name}{real_ext}")
+                        # Remove temp file
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
                         success_count += 1
                         continue
 
-                    # Move and write tags
-                    os.rename(src_path, final_path)
+                    # Move temp file to final location
+                    self.root.after(0, self.log, f"[INFO] 保存为: {final_name}{real_ext}")
+                    os.rename(temp_path, final_path)
+
+                    # Write tags
                     self.write_tags(final_path, real_ext, title, artist, album)
 
-                    # Download cover
+                    # Download and write cover
                     cover_url = getattr(music, "album_pic_url", None) or getattr(music, "cover_url", None)
                     if cover_url:
                         cover_data = self.download_cover(cover_url)
                         self.write_cover(final_path, real_ext, cover_data)
 
-                    self.root.after(0, self.log, f"[OK] {final_name}")
+                    # Download lyrics if enabled
+                    if self.lyric_var.get():
+                        lyric_success, lyric_result = await self.download_lyric(music, final_path)
+                        if lyric_success:
+                            self.root.after(0, self.log, f"[OK] 歌词: {lyric_result}")
+
+                    self.root.after(0, self.log, f"[OK] {final_name}{real_ext}")
                     success_count += 1
 
                 except Exception as e:
